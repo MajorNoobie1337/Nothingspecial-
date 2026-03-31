@@ -1,0 +1,210 @@
+## “””
+OLM Email Automation Script
+
+1. Parses your .olm export file to extract all “Join Now” links
+1. Opens each link in Chrome and automates:
+- Click “Join Now”
+- Click “J’accepte le produit”
+- Click “Rejoindre un compte”
+
+Requirements:
+pip install selenium webdriver-manager
+“””
+
+import zipfile
+import xml.etree.ElementTree as ET
+import re
+import time
+import logging
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+
+OLM_FILE = “your_emails.olm”          # ← Change to your actual .olm file path
+JOIN_LINK_PATTERN = r’https?://[^\s”<>]+join[^\s”<>]+’  # adjust if needed
+WAIT_TIMEOUT = 15        # seconds to wait for each element
+DELAY_BETWEEN_EMAILS = 3 # seconds pause between processing each email
+LOG_FILE = “automation_log.txt”
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s [%(levelname)s] %(message)s”,
+handlers=[
+logging.FileHandler(LOG_FILE),
+logging.StreamHandler()
+]
+)
+log = logging.getLogger(**name**)
+
+def extract_join_links_from_olm(olm_path: str) -> list[str]:
+“”“Open the .olm (ZIP) archive and scrape all Join Now URLs from XML.”””
+links = []
+
+```
+try:
+    with zipfile.ZipFile(olm_path, 'r') as z:
+        xml_files = [n for n in z.namelist() if n.endswith('.xml')]
+        log.info(f"Found {len(xml_files)} XML files inside {olm_path}")
+
+        for xml_file in xml_files:
+            with z.open(xml_file) as f:
+                try:
+                    content = f.read().decode('utf-8', errors='replace')
+                    found = re.findall(JOIN_LINK_PATTERN, content, re.IGNORECASE)
+                    for link in found:
+                        # Clean up trailing punctuation/quotes that regex may grab
+                        link = link.rstrip('"\'>)')
+                        if link not in links:
+                            links.append(link)
+                except Exception as e:
+                    log.warning(f"Could not parse {xml_file}: {e}")
+
+except zipfile.BadZipFile:
+    log.error(f"{olm_path} is not a valid ZIP/OLM file.")
+
+log.info(f"Extracted {len(links)} unique Join Now links")
+return links
+```
+
+def click_element(driver, wait, strategies: list[tuple]) -> bool:
+“””
+Try multiple (By, value) strategies to find and click an element.
+Returns True if successful, False otherwise.
+“””
+for by, value in strategies:
+try:
+el = wait.until(EC.element_to_be_clickable((by, value)))
+el.click()
+return True
+except Exception:
+continue
+return False
+
+def process_link(driver, url: str, index: int) -> bool:
+“””
+Navigate to a join URL and complete the 3-step flow:
+1. Click “Join Now”  (already on page after opening URL, may auto-load)
+2. Click “J’accepte le produit”
+3. Click “Rejoindre un compte”
+“””
+log.info(f”[{index}] Opening: {url}”)
+wait = WebDriverWait(driver, WAIT_TIMEOUT)
+
+```
+try:
+    driver.get(url)
+    time.sleep(2)  # Let page settle
+
+    # ── STEP 1: Click "Join Now" (if a button exists on landing page) ──
+    # Add / adjust selectors to match the actual page
+    join_now_strategies = [
+        (By.XPATH, "//*[contains(translate(text(),'join now','JOIN NOW'), 'JOIN NOW')]"),
+        (By.XPATH, "//*[contains(@class,'join') and contains(@class,'btn')]"),
+        (By.CSS_SELECTOR, "a[href*='join'], button[id*='join']"),
+        (By.LINK_TEXT, "Join Now"),
+        (By.PARTIAL_LINK_TEXT, "Join"),
+    ]
+    clicked = click_element(driver, wait, join_now_strategies)
+    if clicked:
+        log.info(f"[{index}] ✓ Clicked 'Join Now'")
+        time.sleep(2)
+    else:
+        log.warning(f"[{index}] 'Join Now' button not found — page may have loaded directly")
+
+    # ── STEP 2: Click "J'accepte le produit" ──────────────────────────
+    accepte_strategies = [
+        (By.XPATH, "//*[contains(text(), \"J'accepte le produit\")]"),
+        (By.XPATH, "//*[contains(text(), 'accepte') and contains(text(), 'produit')]"),
+        (By.CSS_SELECTOR, "[id*='accept'], [class*='accept']"),
+        (By.PARTIAL_LINK_TEXT, "accepte"),
+    ]
+    clicked = click_element(driver, wait, accepte_strategies)
+    if clicked:
+        log.info(f"[{index}] ✓ Clicked \"J'accepte le produit\"")
+        time.sleep(2)
+    else:
+        log.error(f"[{index}] ✗ Could not find \"J'accepte le produit\"")
+        return False
+
+    # ── STEP 3: Click "Rejoindre un compte" ───────────────────────────
+    rejoindre_strategies = [
+        (By.XPATH, "//*[contains(text(), 'Rejoindre un compte')]"),
+        (By.XPATH, "//*[contains(text(), 'Rejoindre')]"),
+        (By.CSS_SELECTOR, "[id*='rejoindre'], [class*='rejoindre']"),
+        (By.PARTIAL_LINK_TEXT, "Rejoindre"),
+    ]
+    clicked = click_element(driver, wait, rejoindre_strategies)
+    if clicked:
+        log.info(f"[{index}] ✓ Clicked 'Rejoindre un compte'")
+        time.sleep(2)
+    else:
+        log.error(f"[{index}] ✗ Could not find 'Rejoindre un compte'")
+        return False
+
+    log.info(f"[{index}] ✅ Completed successfully")
+    return True
+
+except Exception as e:
+    log.error(f"[{index}] Unexpected error: {e}")
+    return False
+```
+
+def main():
+# ── Extract links from OLM ─────────────────────────────────────────────
+links = extract_join_links_from_olm(OLM_FILE)
+
+```
+if not links:
+    log.error("No join links found. Check OLM_FILE path and JOIN_LINK_PATTERN.")
+    return
+
+# ── Set up Chrome (visible) ────────────────────────────────────────────
+options = webdriver.ChromeOptions()
+options.add_argument("--start-maximized")
+options.add_argument("--disable-notifications")
+# options.add_argument("--headless")  # Uncomment to run hidden
+
+driver = webdriver.Chrome(
+    service=Service(ChromeDriverManager().install()),
+    options=options
+)
+
+# ── Process each link ──────────────────────────────────────────────────
+results = {"success": 0, "failed": 0, "failed_urls": []}
+
+try:
+    for i, url in enumerate(links, start=1):
+        log.info(f"\n{'─'*60}")
+        log.info(f"Processing {i}/{len(links)}")
+        success = process_link(driver, url, i)
+
+        if success:
+            results["success"] += 1
+        else:
+            results["failed"] += 1
+            results["failed_urls"].append(url)
+
+        time.sleep(DELAY_BETWEEN_EMAILS)
+
+finally:
+    driver.quit()
+
+# ── Summary ────────────────────────────────────────────────────────────
+log.info(f"\n{'='*60}")
+log.info(f"DONE — {results['success']} succeeded, {results['failed']} failed")
+if results["failed_urls"]:
+    log.info("Failed URLs:")
+    for u in results["failed_urls"]:
+        log.info(f"  • {u}")
+log.info(f"Full log saved to: {LOG_FILE}")
+```
+
+if **name** == “**main**”:
+main()
