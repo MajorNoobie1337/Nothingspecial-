@@ -80,12 +80,12 @@ def process_invite(page, url: str, index: int, total: int) -> bool:
 
         # Scroll down to make sure checkbox is visible
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
+        time.sleep(3)
 
-        # STEP 1: Tick checkbox - exact selector from screenshot
+        # STEP 1: Tick checkbox - exact ID from page inspection
         try:
-            page.wait_for_selector("input[type='checkbox']", timeout=8000)
-            page.click("input[type='checkbox']")
+            page.wait_for_selector("#terms-and-condition-checkbox", timeout=12000)
+            page.click("label[for='terms-and-condition-checkbox']")
             log.info(f"[{index}] OK - Ticked checkbox")
         except PlaywrightTimeout:
             log.error(f"[{index}] FAIL - Checkbox not found")
@@ -199,7 +199,7 @@ def main():
 
 
         try:
-            for i, url in enumerate(links, start=1):
+            for i, url in enumerate(links[:1], start=1):  # TEST: only 1 invite, change to links for all
                 success = process_invite(page, url, i, total)
                 if success:
                     results["success"] += 1
