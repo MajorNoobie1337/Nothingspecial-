@@ -3,8 +3,8 @@ IBM Cloud Invite Automation - Playwright + Edge
 -------------------------------------------------
 1. Parses your .olm export to extract IBM Cloud invite links
 2. For each link opens Edge and:
-   - Clicks "J'accepte le produit"
-   - Clicks "Rejoindre un compte"
+   - Ticks the checkbox "J'accepte le produit"
+   - Clicks the "Rejoindre un compte" button (unlocked after checkbox)
 
 Requirements:
     pip install playwright
@@ -19,12 +19,15 @@ import re
 import time
 import logging
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+import random
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 OLM_FILE = "your_emails.olm"       # <- Change to your actual .olm file path
 WAIT_TIMEOUT = 20000                # milliseconds (20 seconds)
 DELAY_BETWEEN_EMAILS = 4            # seconds pause between each invite
 LOG_FILE = "automation_log.txt"
+PROXY_USER = "your_username"        # <- Your corporate proxy username
+PROXY_PASS = "your_password"        # <- Your corporate proxy password
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -37,21 +40,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# IBM Cloud invite URL pattern
 IBM_INVITE_PATTERN = (
     r'https://cloud\.ibm\.com/registration/accept-invite-start\?token=[A-Za-z0-9\-_]+'
 )
 
 
-def extract_ibm_invite_links(olm_path: str) -> list[str]:
+def extract_ibm_invite_links(olm_path: str) -> list:
     """Unzip the .olm archive and find all IBM Cloud invite URLs."""
     links = []
-
     try:
         with zipfile.ZipFile(olm_path, 'r') as z:
             xml_files = [n for n in z.namelist() if n.endswith('.xml')]
             log.info(f"Found {len(xml_files)} XML files inside '{olm_path}'")
-
             for xml_file in xml_files:
                 with z.open(xml_file) as f:
                     try:
@@ -63,7 +63,6 @@ def extract_ibm_invite_links(olm_path: str) -> list[str]:
                                 links.append(link)
                     except Exception as e:
                         log.warning(f"Could not read {xml_file}: {e}")
-
     except zipfile.BadZipFile:
         log.error(f"'{olm_path}' is not a valid .olm/ZIP file.")
         return []
@@ -76,68 +75,75 @@ def process_invite(page, url: str, index: int, total: int) -> bool:
     """
     Full flow for one IBM Cloud invite:
       1. Load the invite URL
-      2. Click "J'accepte le produit"
-      3. Click "Rejoindre un compte"
+      2. Tick checkbox "J'accepte le produit"
+      3. Click "Rejoindre un compte" button (becomes active after checkbox)
     """
     log.info(f"\n[{index}/{total}] {url}")
 
     try:
-        page.goto(url, wait_until="networkidle", timeout=WAIT_TIMEOUT)
-        time.sleep(2)  # Extra settle time for IBM Cloud
+        page.goto(url, wait_until="domcontentloaded", timeout=WAIT_TIMEOUT)
+        time.sleep(6)  # Let IBM Cloud fully render all elements
 
-        # ── STEP 1: Accept the product ("J'accepte le produit") ───────────
-        accepte_selectors = [
-            "text=J'accepte le produit",
-            "text=accepte le produit",
-            "label:has-text('accepte')",
-            "input[type='checkbox']",
-            "[id*='accept']",
-            "[class*='accept']",
+        # ── STEP 1: Tick the checkbox next to "J'accepte le produit" ──────
+        # From the screenshot: it's a checkbox input inside "Avis de compte"
+        checkbox_selectors = [
+            "input[type='checkbox']",                      # direct checkbox
+            "label:has-text('accepte le produit')",        # click the label
+            "label:has-text('accepte')",                   # shorter match
+            ".bx--checkbox-label:has-text('accepte')",     # IBM Carbon design
+            "[class*='checkbox']:has-text('accepte')",
         ]
 
-        clicked = False
-        for selector in accepte_selectors:
+        ticked = False
+        for selector in checkbox_selectors:
             try:
                 page.wait_for_selector(selector, timeout=5000)
                 page.click(selector)
-                clicked = True
-                log.info(f"[{index}] OK - Clicked \"J'accepte le produit\"")
+                ticked = True
+                log.info(f"[{index}] OK - Ticked checkbox 'J'accepte le produit'")
                 break
             except PlaywrightTimeout:
                 continue
+            except Exception:
+                continue
 
-        if not clicked:
-            log.error(f"[{index}] FAIL - Could not find \"J'accepte le produit\"")
+        if not ticked:
+            log.error(f"[{index}] FAIL - Could not find the checkbox")
             return False
 
-        time.sleep(2)
+        time.sleep(2)  # Give page time to enable the Rejoindre button
 
-        # ── STEP 2: Submit ("Rejoindre un compte") ─────────────────────────
+        # ── STEP 2: Click "Rejoindre un compte" (enabled after checkbox) ──
+        # From screenshot: greyed button at bottom, becomes blue after checkbox
         rejoindre_selectors = [
-            "text=Rejoindre un compte",
+            "button:has-text('Rejoindre un compte')",
             "button:has-text('Rejoindre')",
-            "a:has-text('Rejoindre')",
+            "[role='button']:has-text('Rejoindre')",
+            "text=Rejoindre un compte",
             "button[type='submit']",
-            "[id*='rejoindre']",
-            "[class*='rejoindre']",
         ]
 
-        clicked = False
+        joined = False
         for selector in rejoindre_selectors:
             try:
-                page.wait_for_selector(selector, timeout=5000)
-                page.click(selector)
-                clicked = True
-                log.info(f"[{index}] OK - Clicked 'Rejoindre un compte'")
-                break
+                # Wait for it to be visible and not disabled
+                page.wait_for_selector(selector, state="visible", timeout=8000)
+                btn = page.query_selector(selector)
+                if btn and not btn.is_disabled():
+                    btn.click()
+                    joined = True
+                    log.info(f"[{index}] OK - Clicked 'Rejoindre un compte'")
+                    break
             except PlaywrightTimeout:
                 continue
+            except Exception:
+                continue
 
-        if not clicked:
-            log.error(f"[{index}] FAIL - Could not find 'Rejoindre un compte'")
+        if not joined:
+            log.error(f"[{index}] FAIL - 'Rejoindre un compte' not clickable")
             return False
 
-        time.sleep(3)  # Wait for confirmation
+        time.sleep(3)
         log.info(f"[{index}] SUCCESS - Invite accepted")
         return True
 
@@ -147,7 +153,7 @@ def process_invite(page, url: str, index: int, total: int) -> bool:
 
 
 def main():
-    # 1. Extract links
+    # 1. Extract links from OLM
     links = extract_ibm_invite_links(OLM_FILE)
 
     if not links:
@@ -158,21 +164,34 @@ def main():
     total = len(links)
     log.info(f"Starting automation for {total} invites...\n")
 
-    # 2. Results tracker
     results = {"success": 0, "failed": 0, "failed_urls": []}
 
-    # 3. Launch Edge via Playwright
+    # 2. Launch Edge via Playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        import os
+        edge_profile = os.path.expanduser(
+            "~/Library/Application Support/Microsoft Edge"
+        )
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=edge_profile,
             channel="msedge",
-            headless=False,        # Show the browser
-            args=["--start-maximized"]
+            headless=False,
+            args=["--start-maximized"],
+            locale="fr-FR",
+            viewport={"width": 1280, "height": 800},
+            proxy={
+                "server": "http://vip-svc-sra-prx.fr.xcp.net.intra:3132",
+                "username": PROXY_USER,
+                "password": PROXY_PASS,
+            }
         )
-        context = browser.new_context(
-            locale="fr-FR",        # French UI to match button labels
-            viewport={"width": 1280, "height": 800}
-        )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
+
+        # Pause here so you can log in to IBM Cloud manually first
+        page.goto('https://cloud.ibm.com')
+        input('>>> Log in to IBM Cloud in the browser, then press ENTER here to start automation...')
+
 
         try:
             for i, url in enumerate(links, start=1):
@@ -182,12 +201,11 @@ def main():
                 else:
                     results["failed"] += 1
                     results["failed_urls"].append(url)
-                time.sleep(DELAY_BETWEEN_EMAILS)
-
+                time.sleep(DELAY_BETWEEN_EMAILS + random.uniform(1, 3))
         finally:
-            browser.close()
+            context.close()
 
-    # 4. Summary
+    # 3. Summary
     log.info(f"\n{'='*60}")
     log.info(f"DONE: {results['success']}/{total} succeeded, {results['failed']} failed")
     if results["failed_urls"]:
