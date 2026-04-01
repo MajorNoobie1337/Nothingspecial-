@@ -91,14 +91,25 @@ def process_invite(page, url: str, index: int, total: int) -> bool:
             log.error(f"[{index}] FAIL - Checkbox not found")
             return False
 
-        time.sleep(2)
+        time.sleep(5)  # Wait longer for IBM Cloud to process the checkbox
 
         # STEP 2: Click Rejoindre un compte (now enabled)
         try:
             page.wait_for_selector("button:has-text('Rejoindre')", state="visible", timeout=8000)
+            # Scroll button into view and hover before clicking (more human-like)
             btn = page.query_selector("button:has-text('Rejoindre')")
             if btn and not btn.is_disabled():
+                btn.scroll_into_view_if_needed()
+                time.sleep(1)
+                btn.hover()
+                time.sleep(1)
                 btn.click()
+                time.sleep(3)
+                # Check if error appeared
+                error = page.query_selector("text=Aie")
+                if error:
+                    log.error(f"[{index}] FAIL - IBM Cloud returned Aie error")
+                    return False
                 log.info(f"[{index}] OK - Clicked Rejoindre un compte")
             else:
                 log.error(f"[{index}] FAIL - Rejoindre button still disabled")
