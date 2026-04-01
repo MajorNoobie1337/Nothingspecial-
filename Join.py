@@ -72,44 +72,49 @@ def extract_ibm_invite_links(olm_path: str) -> list:
 
 
 def process_invite(page, url: str, index: int, total: int) -> bool:
-    """
-    Full flow for one IBM Cloud invite:
-      1. Load the invite URL
-      2. Tick checkbox "J'accepte le produit"
-      3. Click "Rejoindre un compte" button (becomes active after checkbox)
-    """
-    log.info(f"\n[{index}/{total}] {url}")
-
+    log.info(f"
+[{index}/{total}] {url}")
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=WAIT_TIMEOUT)
-        time.sleep(6)  # Let IBM Cloud fully render all elements
+        time.sleep(4)
 
-        # ── STEP 1: Tick the checkbox next to "J'accepte le produit" ──────
-        # From the screenshot: it's a checkbox input inside "Avis de compte"
-        checkbox_selectors = [
-            "input[type='checkbox']",                      # direct checkbox
-            "label:has-text('accepte le produit')",        # click the label
-            "label:has-text('accepte')",                   # shorter match
-            ".bx--checkbox-label:has-text('accepte')",     # IBM Carbon design
-            "[class*='checkbox']:has-text('accepte')",
-        ]
+        # Scroll down to make sure checkbox is visible
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(2)
 
-        ticked = False
-        for selector in checkbox_selectors:
-            try:
-                page.wait_for_selector(selector, timeout=5000)
-                page.click(selector)
-                ticked = True
-                log.info(f"[{index}] OK - Ticked checkbox 'J'accepte le produit'")
-                break
-            except PlaywrightTimeout:
-                continue
-            except Exception:
-                continue
-
-        if not ticked:
-            log.error(f"[{index}] FAIL - Could not find the checkbox")
+        # STEP 1: Tick checkbox - exact selector from screenshot
+        try:
+            page.wait_for_selector("input[type='checkbox']", timeout=8000)
+            page.click("input[type='checkbox']")
+            log.info(f"[{index}] OK - Ticked checkbox")
+        except PlaywrightTimeout:
+            log.error(f"[{index}] FAIL - Checkbox not found")
             return False
+
+        time.sleep(2)
+
+        # STEP 2: Click Rejoindre un compte (now enabled)
+        try:
+            page.wait_for_selector("button:has-text('Rejoindre')", state="visible", timeout=8000)
+            btn = page.query_selector("button:has-text('Rejoindre')")
+            if btn and not btn.is_disabled():
+                btn.click()
+                log.info(f"[{index}] OK - Clicked Rejoindre un compte")
+            else:
+                log.error(f"[{index}] FAIL - Rejoindre button still disabled")
+                return False
+        except PlaywrightTimeout:
+            log.error(f"[{index}] FAIL - Rejoindre button not found")
+            return False
+
+        time.sleep(3)
+        log.info(f"[{index}] SUCCESS")
+        return True
+
+    except Exception as e:
+        log.error(f"[{index}] Error: {e}")
+        return False
+
 
         time.sleep(2)  # Give page time to enable the Rejoindre button
 
