@@ -1,0 +1,123 @@
+#cloud-config
+
+# Input Terraform variables:
+# - root_password
+# - dns_servers
+# - search_list
+# - hostname
+# - ais_cidr      (empty for non-vital accounts -> AIS block skipped)
+# - ais_gateway
+
+# Enable SSH password authentication
+ssh_pwauth: True
+
+# Actions run through dedicated script
+runcmd:
+  - |
+      # Logs are in: /var/log/cloud-init-output.log
+      function log() {
+        echo "$(date +%T) $1" >> /var/log/cloud-init-runcmd.log
+      }
+      VAL=`find /etc/sysconfig/network-scripts -name 'ifcfg-net0' | wc -l`
+      if [ "$VAL" == "1" ];then
+        exit
+      fi
+
+      echo "root:${root_password}" | chpasswd
+
+      cd /etc/sysconfig/network-scripts
+      mv ifcfg-eth0 ifcfg-net0
+      # Scope detection to the PRIMARY device. Unqualified, these pick up the
+      # AIS NIC too once a second interface exists: "ifconfig | grep broadcast"
+      # returns one netmask PER interface, so NETMASK below would be written
+      # with two values and the primary interface config would be corrupted.
+      PRIMARY_IF=`ip route show default | awk '{print $5}' | head -n1`
+      GW=`ip route show default | awk '{print $3}' | head -n1`
+      IP=`ip -4 -o addr show dev $PRIMARY_IF | awk '{print $4}' | cut -d/ -f1`
+      MASK=`ifconfig $PRIMARY_IF | grep broadcast | awk '{print $4}'`
+      log "IP=$IP GW=$GW MASK=$MASK"
+      echo "IPADDR=$IP" >> ifcfg-net0
+      echo "NETMASK=$MASK" >> ifcfg-net0
+      echo "GATEWAY=$GW" >> ifcfg-net0
+      echo 'NAME=net0' >> ifcfg-net0
+      echo "PROXY_METHOD=none" >> ifcfg-net0
+      echo "BROWSER_ONLY=no" >> ifcfg-net0
+      echo "DEFROUTE=yes" >> ifcfg-net0
+      echo "IPV4_FAILURE_FATAL=no" >> ifcfg-net0
+      echo "IPV6_AUTOCONF=yes" >> ifcfg-net0
+      echo "IPV6_DEFROUTE=yes" >> ifcfg-net0
+      echo "IPV6_FAILURE_FATAL=no" >> ifcfg-net0
+      echo 'RES_OPTIONS="timeout:2 attempts:1 rotate"' >> ifcfg-net0
+      sed -i 's/BOOTPROTO=dhcp/BOOTPROTO=none/g' ifcfg-net0
+
+      # Set search_list (if provided)
+      searchlist="${search_list}"
+      if [ "$searchlist" != "" ]; then
+        log "Updating DOMAIN: $searchlist"
+        echo "DOMAIN=$searchlist" >> ifcfg-net0
+      fi
+
+      # Restart network
+      systemctl restart NetworkManager
+
+      # ------------------------------------------------------------------
+      # AIS secondary interface (vital accounts only).
+      # Empty ais_cidr => non-vital => this whole block is skipped.
+      #
+      # Two problems are fixed here:
+      #  1. The block above only ever configures the primary NIC, so the AIS
+      #     interface would come up with no address at all.
+      #  2. Even once addressed, replies sourced from the AIS IP would follow
+      #     the DEFAULT route (primary NIC). A packet leaving the primary NIC
+      #     with a source address belonging to the AIS NIC is dropped by VPC
+      #     anti-spoofing, so the connection just times out. Source-based
+      #     policy routing sends those replies out the AIS NIC instead.
+      # ------------------------------------------------------------------
+      AIS_CIDR="${ais_cidr}"
+      AIS_GW="${ais_gateway}"
+      if [ -n "$AIS_CIDR" ]; then
+        log "AIS: configuring secondary interface (cidr=$AIS_CIDR gw=$AIS_GW)"
+
+        # Primary = interface holding the default route; AIS = the other one.
+        PRIMARY_IF=`ip route show default | awk '{print $5}' | head -n1`
+        AIS_IF=`ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' | grep -v "^$PRIMARY_IF$" | head -n1`
+        log "AIS: primary_if=$PRIMARY_IF ais_if=$AIS_IF"
+
+        if [ -n "$AIS_IF" ]; then
+          # Bring the NIC up via DHCP. DEFROUTE=no keeps the default route on
+          # the primary interface - the AIS default lives in its own table.
+          cat > /etc/sysconfig/network-scripts/ifcfg-$AIS_IF <<EOF
+DEVICE=$AIS_IF
+NAME=$AIS_IF
+BOOTPROTO=dhcp
+ONBOOT=yes
+DEFROUTE=no
+IPV4_FAILURE_FATAL=no
+IPV6INIT=no
+EOF
+
+          # Dedicated routing table for AIS-sourced traffic.
+          grep -q '^200 ais$' /etc/iproute2/rt_tables || echo '200 ais' >> /etc/iproute2/rt_tables
+          echo "default via $AIS_GW dev $AIS_IF table ais" > /etc/sysconfig/network-scripts/route-$AIS_IF
+          echo "from $AIS_CIDR lookup ais" > /etc/sysconfig/network-scripts/rule-$AIS_IF
+
+          # Loose reverse-path filtering: strict mode (1) drops inbound packets
+          # on the AIS NIC because the main table routes the reply via the
+          # primary. 2 = accept if reachable via any interface.
+          cat > /etc/sysctl.d/99-ais-rp-filter.conf <<EOF
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
+          sysctl -p /etc/sysctl.d/99-ais-rp-filter.conf >/dev/null 2>&1
+
+          ifup $AIS_IF >/dev/null 2>&1 || nmcli connection up $AIS_IF >/dev/null 2>&1
+          AIS_IP=`ip -4 -o addr show dev $AIS_IF 2>/dev/null | awk '{print $4}' | cut -d/ -f1`
+          log "AIS: interface $AIS_IF address=$AIS_IP"
+        else
+          log "AIS: no secondary interface found - skipping"
+        fi
+      fi
+
+      # Generate /etc/hosts
+      echo $IP ${hostname}".fr.net.intra" ${hostname} > /etc/hosts
+      ##shutdown -r now
