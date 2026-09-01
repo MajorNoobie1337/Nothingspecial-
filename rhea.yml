@@ -86,15 +86,14 @@ runcmd:
         if [ -n "$AIS_IF" ]; then
           # Bring the NIC up via DHCP. DEFROUTE=no keeps the default route on
           # the primary interface - the AIS default lives in its own table.
-          cat > /etc/sysconfig/network-scripts/ifcfg-$AIS_IF <<EOF
-DEVICE=$AIS_IF
-NAME=$AIS_IF
-BOOTPROTO=dhcp
-ONBOOT=yes
-DEFROUTE=no
-IPV4_FAILURE_FATAL=no
-IPV6INIT=no
-EOF
+          AIS_CFG=/etc/sysconfig/network-scripts/ifcfg-$AIS_IF
+          echo "DEVICE=$AIS_IF"          >  $AIS_CFG
+          echo "NAME=$AIS_IF"            >> $AIS_CFG
+          echo "BOOTPROTO=dhcp"          >> $AIS_CFG
+          echo "ONBOOT=yes"              >> $AIS_CFG
+          echo "DEFROUTE=no"             >> $AIS_CFG
+          echo "IPV4_FAILURE_FATAL=no"   >> $AIS_CFG
+          echo "IPV6INIT=no"             >> $AIS_CFG
 
           # Dedicated routing table for AIS-sourced traffic.
           grep -q '^200 ais$' /etc/iproute2/rt_tables || echo '200 ais' >> /etc/iproute2/rt_tables
@@ -104,10 +103,9 @@ EOF
           # Loose reverse-path filtering: strict mode (1) drops inbound packets
           # on the AIS NIC because the main table routes the reply via the
           # primary. 2 = accept if reachable via any interface.
-          cat > /etc/sysctl.d/99-ais-rp-filter.conf <<EOF
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-EOF
+          RP=/etc/sysctl.d/99-ais-rp-filter.conf
+          echo "net.ipv4.conf.all.rp_filter = 2"     >  $RP
+          echo "net.ipv4.conf.default.rp_filter = 2" >> $RP
           sysctl -p /etc/sysctl.d/99-ais-rp-filter.conf >/dev/null 2>&1
 
           ifup $AIS_IF >/dev/null 2>&1 || nmcli connection up $AIS_IF >/dev/null 2>&1
