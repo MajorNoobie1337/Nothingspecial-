@@ -1,0 +1,47 @@
+#cloud-config
+
+# Input Terraform variables:
+# - root_password
+# - dns_servers
+# - search_list
+# - hostname
+
+# HOTFIX: RDP authentication
+runcmd:
+  - 'echo "start cloud-init process" >> c:/cloud-init.log'
+  - 'netsh interface ipv4 show interfaces >> c:/cloud-init.log'
+  - 'timeout 10 > NUL'
+  - 'netsh interface ipv4 show interfaces >> c:/cloud-init.log'
+  - 'setlocal enabledelayedexpansion'
+  - 'set dnsservers=${dns_servers}'
+  - 'set /A c=1'
+  - 'echo "Setting DNS servers" >> c:/cloud-init.log'
+  - 'for %%a in ("%dnsservers:,=" "%") do ('
+  - 'if !c! == 1 ('
+  - '    echo "Setting main DNS server to %%~a" >> c:/cloud-init.log'
+  - '    netsh interface ipv4 set dns name="Ethernet Instance 0" static %%~a  >> c:/cloud-init.log'
+  - '    netsh interface ipv4 set dns name="Ethernet" static %%~a  >> c:/cloud-init.log'
+  - ') else ('
+  - 'echo "Setting secondary (index=!c!) DNS server to %%~a" >> c:/cloud-init.log'
+  - 'netsh interface ipv4 add dns name="Ethernet Instance 0" %%~a index=!c! >> c:/cloud-init.log'
+  - 'netsh interface ipv4 add dns name="Ethernet" %%~a index=!c! >> c:/cloud-init.log'
+  - ')'
+  - 'set /A c+=1'
+  - ')'
+  - 'netsh interface ipv4 show config >> c:/cloud-init.log'
+  - 'echo "test" >> c:/cloud-init.log'
+  - 'echo "Changing administrator password......" >> c:/cloud-init.log'
+  - 'net user administrator ${root_password} >> c:/cloud-init.log'
+  - 'echo "Set dns (${dns_servers}) on network interface" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile -Command "Get-NetAdapter | Where-Object {$_.Name -like "*Ethernet*"} | Set-DnsClientServerAddress -ServerAddresses ${dns_servers}" >> c:/cloud-init.log'
+  - 'net stop sshd >> c:/cloud-init.log'
+  - 'reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\sshd" /v ObjectName /d "LocalSystem" /f >> c:/cloud-init.log'
+  - 'net start sshd >> c:/cloud-init.log'
+  - 'reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-TCP" /v UserAuthentication /t REG_DWORD /d "0" /f'
+  - 'echo "Rename computer" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile -Command "Rename-Computer -NewName ${hostname} -confirm:$false"  >> c:/cloud-init.log'
+  - 'echo "Set Search List" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile -Command "Set-DnsClientGlobalSetting -SuffixSearchList @("apps.tech.net.intra","tech.net.intra","fr.net.intra","net.intra","fr.xcd.net.intra")"
+  - 'tzutil /s "Romance Standard Time"'
+  - 'echo "Done" >> c:/cloud-init.log'
+  - 'shutdown /r'
