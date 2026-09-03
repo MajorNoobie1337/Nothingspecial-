@@ -7,7 +7,6 @@
 # - hostname
 # - ais_cidr      (empty for non-vital accounts -> AIS block not rendered)
 # - ais_gateway
-# - ais_routes    (CIDRs to reach over the AIS NIC)
 
 # HOTFIX: RDP authentication
 runcmd:
@@ -42,15 +41,13 @@ runcmd:
   - 'net start sshd >> c:/cloud-init.log'
   - 'reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-TCP" /v UserAuthentication /t REG_DWORD /d "0" /f'
   - 'echo "Rename computer" >> c:/cloud-init.log'
-  - 'powershell.exe -inputformat none -noprofile -Command "Rename-Computer -NewName ${hostname} -confirm:$false"  >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile - Command "Rename-Computer -NewName ${hostname} -confirm:$false"  >> c:/cloud-init.log'
   - 'echo "Set Search List" >> c:/cloud-init.log'
   - 'powershell.exe -inputformat none -noprofile -Command "Set-DnsClientGlobalSetting -SuffixSearchList @("apps.tech.net.intra","tech.net.intra","fr.net.intra","net.intra","fr.xcd.net.intra")"'
 %{ if ais_cidr != "" ~}
   - 'echo "AIS: secondary interface setup (cidr=${ais_cidr} gw=${ais_gateway})" >> c:/cloud-init.log'
-  - 'powershell.exe -inputformat none -noprofile -Command "(Find-NetRoute -RemoteIPAddress ''${ais_gateway}'' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InterfaceIndex)" >> c:/cloud-init.log'
-%{ for route in ais_routes ~}
-  - 'powershell.exe -inputformat none -noprofile -Command "$idx = Find-NetRoute -RemoteIPAddress ''${ais_gateway}'' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InterfaceIndex; if ($idx) { New-NetRoute -DestinationPrefix ''${route}'' -InterfaceIndex $idx -NextHop ''${ais_gateway}'' -PolicyStore PersistentStore -ErrorAction SilentlyContinue } else { Write-Output ''AIS: interface not found for ${route}'' }" >> c:/cloud-init.log'
-%{ endfor ~}
+  - 'powershell.exe -inputformat none -noprofile -Command "$idx = Find-NetRoute -RemoteIPAddress ''${ais_gateway}'' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InterfaceIndex; Write-Output (''AIS interface index: '' + $idx)" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile -Command "$idx = Find-NetRoute -RemoteIPAddress ''${ais_gateway}'' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InterfaceIndex; if ($idx) { New-NetRoute -DestinationPrefix ''0.0.0.0/0'' -InterfaceIndex $idx -NextHop ''${ais_gateway}'' -RouteMetric 9999 -PolicyStore PersistentStore -ErrorAction SilentlyContinue; Write-Output ''AIS: default route added (metric 9999)'' } else { Write-Output ''AIS: interface not found'' }" >> c:/cloud-init.log'
 %{ endif ~}
   - 'tzutil /s "Romance Standard Time"'
   - 'echo "Done" >> c:/cloud-init.log'
