@@ -1,0 +1,41 @@
+  ais_vni_id = var.ais_subnet != null ? one([
+    for attachment in data.ibm_is_instance.vsi[0].network_attachments :
+    attachment.virtual_network_interface[0].id
+    if attachment.subnet[0].id == data.ibm_is_subnet.ais[0].id
+  ]) : null
+
+##############################################################################
+# AIS SECONDARY INTERFACE - MAC ADDRESS
+##############################################################################
+# The MAC is only exposed on a VirtualNetworkInterface: the VPC API has no
+# mac_address on the classic NetworkInterface type. So read the instance back,
+# find the network attachment sitting on the AIS subnet, and resolve its VNI.
+#
+# Read via a DATA source (not the VNI resource) on purpose: mac_address is
+# "absent when the interface is not attached to a target", so a resource-side
+# read during create would come back empty. By the time this data source runs
+# the instance - and therefore the attachment - already exists.
+data "ibm_is_instance" "vsi" {
+  count = var.ais_subnet != null ? 1 : 0
+  name  = module.build_vsi.slz_vsi.list[0].name
+
+  lifecycle {
+    postcondition {
+      condition = length([
+        for a in self.network_attachments : a
+        if a.subnet[0].id == data.ibm_is_subnet.ais[0].id
+      ]) == 1
+      error_message = "Expected exactly one network attachment on AIS subnet ${var.ais_subnet}. If this instance uses classic network_interfaces rather than network attachments, no VNI exists and the MAC cannot be resolved."
+    }
+  }
+}
+
+data "ibm_is_virtual_network_interface" "ais" {
+  count                     = var.ais_subnet != null ? 1 : 0
+  virtual_network_interface = local.ais_vni_id
+}
+
+# MAC of the AIS interface, for deterministic NIC identification in the guest.
+output "ais_mac_address" {
+  value = var.ais_subnet != null ? data.ibm_is_virtual_network_interface.ais[0].mac_address : null
+}
