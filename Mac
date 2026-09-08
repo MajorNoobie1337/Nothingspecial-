@@ -39,3 +39,25 @@ data "ibm_is_virtual_network_interface" "ais" {
 output "ais_mac_address" {
   value = var.ais_subnet != null ? data.ibm_is_virtual_network_interface.ais[0].mac_address : null
 }
+
+
+  ais_cidr    = var.ais_subnet != null ? data.ibm_is_subnet.ais[0].ipv4_cidr_block : ""
+  ais_gateway = var.ais_subnet != null ? cidrhost(data.ibm_is_subnet.ais[0].ipv4_cidr_block, 1) : ""
+  ais_netmask = var.ais_subnet != null ? cidrnetmask(data.ibm_is_subnet.ais[0].ipv4_cidr_block) : ""
+
+
+
+  # AIS network facts needed to configure the secondary interface inside the
+  # guest. Derived from the subnet (plan-time), unlike vm_ais_ip which is an
+  # instance attribute. Consumed by os-configuration, which runs AFTER the VSI
+  # exists and therefore may also use vm_ais_ip - cloud-init may not (cycle).
+  vm_ais_gateway = var.cloud_provider == "ibmcloud" && var.ais_subnet != null ? module.ibmcloud_vsi[0].ais_gateway : null
+  vm_ais_netmask = var.cloud_provider == "ibmcloud" && var.ais_subnet != null ? module.ibmcloud_vsi[0].ais_netmask : null
+  vm_ais_cidr    = var.cloud_provider == "ibmcloud" && var.ais_subnet != null ? module.ibmcloud_vsi[0].ais_cidr    : null
+  vm_ais_mac     = var.cloud_provider == "ibmcloud" && var.ais_subnet != null ? module.ibmcloud_vsi[0].ais_mac_address : null
+
+# MAC of the AIS NIC - lets the guest identify the interface deterministically,
+# independent of kernel naming (eth1 / ens6) or enumeration order.
+output "vm_ais_mac" {
+  value = local.vm_ais_mac
+}
