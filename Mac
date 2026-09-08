@@ -61,3 +61,15 @@ output "ais_mac_address" {
 output "vm_ais_mac" {
   value = local.vm_ais_mac
 }
+
+
+# DAR (AIS) interface parameters. os-configuration connects over the PRIMARY
+  # interface - the AIS NIC has no usable route until the guest is configured -
+  # and uses these to bring up and route eth1. Null for non-vital accounts.
+  # Safe to use the AIS IP here (unlike cloud-init): this module runs after
+  # os_envelope, so there is no dependency cycle.
+  dar_enabled         = local.is_vital
+  dar_ip      = local.is_vital ? module.os_envelope.vm_ais_ipaddress : null
+  dar_gateway = local.is_vital ? module.os_envelope.vm_ais_gateway   : null
+  dar_mask    = local.is_vital ? module.os_envelope.vm_ais_netmask   : null
+  dar_mac_address = local.is_vital ? module.os_envelope.vm_ais_mac : null
