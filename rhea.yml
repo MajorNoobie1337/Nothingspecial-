@@ -1,121 +1,120 @@
 #cloud-config
-
-# Input Terraform variables:
+# Template variables:
 # - root_password
-# - dns_servers
 # - search_list
 # - hostname
-# - ais_cidr      (empty for non-vital accounts -> AIS block skipped)
-# - ais_gateway
 
 # Enable SSH password authentication
-ssh_pwauth: True
+ssh_pwauth: true
 
-# Actions run through dedicated script
 runcmd:
   - |
-      # Logs are in: /var/log/cloud-init-output.log
-      function log() {
-        echo "$(date +%T) $1" >> /var/log/cloud-init-runcmd.log
+    set -eu
+
+    # Set the root password before any network checks or early exits.
+    echo "root:${root_password}" | chpasswd
+
+    log() {
+      printf '%s %s\n' "$(date +%T)" "$1" >> /var/log/cloud-init-runcmd.log
+    }
+
+    cd /etc/sysconfig/network-scripts
+
+    if [ -f ifcfg-net0 ]; then
+      log "ifcfg-net0 already exists; skipping network configuration"
+      exit 0
+    fi
+
+    if [ ! -f ifcfg-eth0 ]; then
+      log "Missing ifcfg-eth0; stopping"
+      exit 1
+    fi
+
+    # Read the IPv4 address from eth0 only.
+    CIDRS=$(ip -4 -o addr show dev eth0 scope global |
+      awk '{print $4}')
+
+    COUNT=$(printf '%s\n' "$CIDRS" |
+      awk 'NF {n++} END {print n+0}')
+
+    if [ "$COUNT" -ne 1 ]; then
+      log "Expected exactly one global IPv4 address on eth0; stopping"
+      exit 1
+    fi
+
+    IP=$(printf '%s\n' "$CIDRS" | cut -d/ -f1)
+    PREFIX=$(printf '%s\n' "$CIDRS" | cut -d/ -f2)
+
+    GW=$(ip -4 route show default dev eth0 |
+      awk '{for (i=1; i<NF; i++) if ($i=="via") {print $(i+1); exit}}')
+
+    MAC=$(cat /sys/class/net/eth0/address)
+
+    log "DEVICE=eth0 IP=$IP PREFIX=$PREFIX GW=$GW MAC=$MAC"
+
+    # Back up the original configuration outside this directory.
+    BACKUP_DIR=$(mktemp -d /root/network-backup.XXXXXX)
+    cp -p ifcfg-eth0 "$BACKUP_DIR/ifcfg-eth0"
+    mv ifcfg-eth0 ifcfg-net0
+
+    # Remove settings being replaced.
+    # Existing DNS settings, UUID and unrelated options are preserved.
+    sed -i -E '/^(IPADDR[0-9]*|PREFIX[0-9]*|NETMASK[0-9]*|GATEWAY[0-9]*|BOOTPROTO|DEVICE|HWADDR|NAME|ONBOOT|PROXY_METHOD|BROWSER_ONLY|DEFROUTE|IPV4_FAILURE_FATAL|IPV6_AUTOCONF|IPV6_DEFROUTE|IPV6_FAILURE_FATAL|RES_OPTIONS)=/d' ifcfg-net0
+
+    {
+      printf 'DEVICE=eth0\n'
+      printf 'HWADDR=%s\n' "$MAC"
+      printf 'NAME=net0\n'
+      printf 'ONBOOT=yes\n'
+      printf 'BOOTPROTO=none\n'
+      printf 'IPADDR=%s\n' "$IP"
+      printf 'PREFIX=%s\n' "$PREFIX"
+
+      if [ -n "$GW" ]; then
+        printf 'GATEWAY=%s\n' "$GW"
+      fi
+
+      printf 'PROXY_METHOD=none\n'
+      printf 'BROWSER_ONLY=no\n'
+      printf 'DEFROUTE=yes\n'
+      printf 'IPV4_FAILURE_FATAL=no\n'
+      printf 'IPV6_AUTOCONF=yes\n'
+      printf 'IPV6_DEFROUTE=yes\n'
+      printf 'IPV6_FAILURE_FATAL=no\n'
+      printf 'RES_OPTIONS="timeout:2 attempts:1 rotate"\n'
+    } >> ifcfg-net0
+
+    # Set the DNS search list if provided.
+    searchlist="${search_list}"
+
+    if [ -n "$searchlist" ]; then
+      log "Updating DOMAIN: $searchlist"
+      sed -i '/^DOMAIN=/d' ifcfg-net0
+      printf 'DOMAIN="%s"\n' "$searchlist" >> ifcfg-net0
+    fi
+
+    # Update the hostname entry while preserving other hosts.
+    cp -p /etc/hosts "$BACKUP_DIR/hosts"
+
+    awk -v short="${hostname}" -v fqdn="${hostname}.fr.net.intra" '
+      /^[[:space:]]*#/ {print; next}
+      {
+        drop=0
+        for (i=2; i<=NF; i++) {
+          if ($i ~ /^#/) break
+          if ($i==short || $i==fqdn) drop=1
+        }
+        if (!drop) print
       }
-      VAL=`find /etc/sysconfig/network-scripts -name 'ifcfg-net0' | wc -l`
-      if [ "$VAL" == "1" ];then
-        exit
-      fi
+    ' /etc/hosts > "$BACKUP_DIR/hosts.updated"
 
-      echo "root:${root_password}" | chpasswd
+    printf '%s %s %s\n' \
+      "$IP" \
+      "${hostname}.fr.net.intra" \
+      "${hostname}" >> "$BACKUP_DIR/hosts.updated"
 
-      cd /etc/sysconfig/network-scripts
-      mv ifcfg-eth0 ifcfg-net0
-      # Scope detection to the PRIMARY device. Unqualified, these pick up the
-      # AIS NIC too once a second interface exists: "ifconfig | grep broadcast"
-      # returns one netmask PER interface, so NETMASK below would be written
-      # with two values and the primary interface config would be corrupted.
-      PRIMARY_IF=`ip route show default | awk '{print $5}' | head -n1`
-      GW=`ip route show default | awk '{print $3}' | head -n1`
-      IP=`ip -4 -o addr show dev $PRIMARY_IF | awk '{print $4}' | cut -d/ -f1`
-      MASK=`ifconfig $PRIMARY_IF | grep broadcast | awk '{print $4}'`
-      log "IP=$IP GW=$GW MASK=$MASK"
-      echo "IPADDR=$IP" >> ifcfg-net0
-      echo "NETMASK=$MASK" >> ifcfg-net0
-      echo "GATEWAY=$GW" >> ifcfg-net0
-      echo 'NAME=net0' >> ifcfg-net0
-      echo "PROXY_METHOD=none" >> ifcfg-net0
-      echo "BROWSER_ONLY=no" >> ifcfg-net0
-      echo "DEFROUTE=yes" >> ifcfg-net0
-      echo "IPV4_FAILURE_FATAL=no" >> ifcfg-net0
-      echo "IPV6_AUTOCONF=yes" >> ifcfg-net0
-      echo "IPV6_DEFROUTE=yes" >> ifcfg-net0
-      echo "IPV6_FAILURE_FATAL=no" >> ifcfg-net0
-      echo 'RES_OPTIONS="timeout:2 attempts:1 rotate"' >> ifcfg-net0
-      sed -i 's/BOOTPROTO=dhcp/BOOTPROTO=none/g' ifcfg-net0
+    cat "$BACKUP_DIR/hosts.updated" > /etc/hosts
 
-      # Set search_list (if provided)
-      searchlist="${search_list}"
-      if [ "$searchlist" != "" ]; then
-        log "Updating DOMAIN: $searchlist"
-        echo "DOMAIN=$searchlist" >> ifcfg-net0
-      fi
-
-      # Restart network
-      systemctl restart NetworkManager
-
-      # ------------------------------------------------------------------
-      # AIS secondary interface (vital accounts only).
-      # Empty ais_cidr => non-vital => this whole block is skipped.
-      #
-      # Two problems are fixed here:
-      #  1. The block above only ever configures the primary NIC, so the AIS
-      #     interface would come up with no address at all.
-      #  2. Even once addressed, replies sourced from the AIS IP would follow
-      #     the DEFAULT route (primary NIC). A packet leaving the primary NIC
-      #     with a source address belonging to the AIS NIC is dropped by VPC
-      #     anti-spoofing, so the connection just times out. Source-based
-      #     policy routing sends those replies out the AIS NIC instead.
-      # ------------------------------------------------------------------
-      AIS_CIDR="${ais_cidr}"
-      AIS_GW="${ais_gateway}"
-      if [ -n "$AIS_CIDR" ]; then
-        log "AIS: configuring secondary interface (cidr=$AIS_CIDR gw=$AIS_GW)"
-
-        # Primary = interface holding the default route; AIS = the other one.
-        PRIMARY_IF=`ip route show default | awk '{print $5}' | head -n1`
-        AIS_IF=`ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' | grep -v "^$PRIMARY_IF$" | head -n1`
-        log "AIS: primary_if=$PRIMARY_IF ais_if=$AIS_IF"
-
-        if [ -n "$AIS_IF" ]; then
-          # Bring the NIC up via DHCP. DEFROUTE=no keeps the default route on
-          # the primary interface - the AIS default lives in its own table.
-          AIS_CFG=/etc/sysconfig/network-scripts/ifcfg-$AIS_IF
-          echo "DEVICE=$AIS_IF"          >  $AIS_CFG
-          echo "NAME=$AIS_IF"            >> $AIS_CFG
-          echo "BOOTPROTO=dhcp"          >> $AIS_CFG
-          echo "ONBOOT=yes"              >> $AIS_CFG
-          echo "DEFROUTE=no"             >> $AIS_CFG
-          echo "IPV4_FAILURE_FATAL=no"   >> $AIS_CFG
-          echo "IPV6INIT=no"             >> $AIS_CFG
-
-          # Dedicated routing table for AIS-sourced traffic.
-          grep -q '^200 ais$' /etc/iproute2/rt_tables || echo '200 ais' >> /etc/iproute2/rt_tables
-          echo "default via $AIS_GW dev $AIS_IF table ais" > /etc/sysconfig/network-scripts/route-$AIS_IF
-          echo "from $AIS_CIDR lookup ais" > /etc/sysconfig/network-scripts/rule-$AIS_IF
-
-          # Loose reverse-path filtering: strict mode (1) drops inbound packets
-          # on the AIS NIC because the main table routes the reply via the
-          # primary. 2 = accept if reachable via any interface.
-          RP=/etc/sysctl.d/99-ais-rp-filter.conf
-          echo "net.ipv4.conf.all.rp_filter = 2"     >  $RP
-          echo "net.ipv4.conf.default.rp_filter = 2" >> $RP
-          sysctl -p /etc/sysctl.d/99-ais-rp-filter.conf >/dev/null 2>&1
-
-          ifup $AIS_IF >/dev/null 2>&1 || nmcli connection up $AIS_IF >/dev/null 2>&1
-          AIS_IP=`ip -4 -o addr show dev $AIS_IF 2>/dev/null | awk '{print $4}' | cut -d/ -f1`
-          log "AIS: interface $AIS_IF address=$AIS_IP"
-        else
-          log "AIS: no secondary interface found - skipping"
-        fi
-      fi
-
-      # Generate /etc/hosts
-      echo $IP ${hostname}".fr.net.intra" ${hostname} > /etc/hosts
-      ##shutdown -r now
+    # Apply the network configuration.
+    log "Applying eth0 configuration; backups: $BACKUP_DIR"
+    systemctl restart NetworkManager
