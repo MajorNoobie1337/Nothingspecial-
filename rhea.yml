@@ -3,8 +3,10 @@
 # - root_password
 # - search_list
 # - hostname
+# - ais_gateway (empty string when AIS is not enabled)
+# - ais_destinations (list of CIDRs; empty list for none)
 
-# Enable SSH password authentication
+# Enable SSH password authentication.
 ssh_pwauth: true
 
 runcmd:
@@ -93,6 +95,41 @@ runcmd:
       printf 'DOMAIN="%s"\n' "$searchlist" >> ifcfg-net0
     fi
 
+    # Configure the optional persistent AIS host routes through eth1. An empty
+    # gateway means AIS is not enabled, in which case the VSI has a single NIC
+    # and there is nothing to do. With AIS enabled eth1 is expected to exist,
+    # so its absence is an anomaly (typically eth1 not yet enumerated) and is
+    # logged as a warning rather than passed over silently.
+    AIS_GATEWAY="${ais_gateway}"
+    AIS_UUID=$(nmcli -g GENERAL.CON-UUID device show eth1 2>/dev/null || true)
+
+    if [ -z "$AIS_GATEWAY" ]; then
+      log "AIS not enabled; single interface, no AIS routes to configure"
+    elif [ ! -d /sys/class/net/eth1 ]; then
+      log "WARNING: AIS enabled but eth1 is absent; no AIS routes configured"
+    elif [ -z "$AIS_UUID" ] || [ "$AIS_UUID" = "--" ]; then
+      log "WARNING: no active NetworkManager connection on eth1; no AIS routes configured"
+    else
+      # Keep the IPv4 default route on eth0.
+      nmcli connection modify uuid "$AIS_UUID" \
+        connection.autoconnect yes \
+        ipv4.never-default yes
+
+      # One nmcli call per destination, unrolled by Terraform at render time.
+      # +ipv4.routes preserves routes already on the profile.
+      %{ for dest in ais_destinations }
+      nmcli connection modify uuid "$AIS_UUID" +ipv4.routes "${dest} $AIS_GATEWAY"
+      log "AIS route added: ${dest} via $AIS_GATEWAY"
+      %{ endfor }
+      # Explicitly activate the saved profile.
+      # If activation fails, log it and continue provisioning.
+      if nmcli connection up uuid "$AIS_UUID" ifname eth1; then
+        log "AIS routes activated on eth1"
+      else
+        log "WARNING: AIS routes saved, but eth1 activation failed; verify connectivity"
+      fi
+    fi
+
     # Update the hostname entry while preserving other hosts.
     cp -p /etc/hosts "$BACKUP_DIR/hosts"
 
@@ -115,6 +152,6 @@ runcmd:
 
     cat "$BACKUP_DIR/hosts.updated" > /etc/hosts
 
-    # Apply the network configuration.
-    log "Applying eth0 configuration; backups: $BACKUP_DIR"
+    # Restart NetworkManager after updating the configuration.
+    log "Restarting NetworkManager; backups: $BACKUP_DIR"
     systemctl restart NetworkManager
