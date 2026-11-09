@@ -1,0 +1,189 @@
+#cloud-config
+
+# Input Terraform variables:
+# - root_password
+# - dns_servers
+# - search_list
+# - hostname
+# - ais_gateway (empty string when AIS is not enabled)
+# - ais_cidr (empty string when AIS is not enabled)
+# - ais_routes (CIDRs routed through the AIS interface)
+
+write_files:
+  # Kept outside Temp: on failure a startup task re-runs this file until it succeeds.
+  - path: 'C:\ProgramData\ais-routes.ps1'
+    content: |
+      $ErrorActionPreference = 'Stop'
+      $LogPath = 'C:\cloud-init.log'
+      $Gateway = '${ais_gateway}'
+      $Cidr = '${ais_cidr}'
+      $RetryTask = 'AIS-Routes-Retry'
+
+      function Write-AisLog([string]$Message) {
+        Add-Content -Path $LogPath -Value ('{0} AIS: {1}' -f (Get-Date -Format T), $Message)
+      }
+
+      if ([string]::IsNullOrWhiteSpace($Gateway)) {
+        Write-AisLog 'AIS not enabled; no routes to configure'
+        exit 0
+      }
+
+      try {
+        function ConvertTo-IPv4Number([string]$Address) {
+          $Bytes = [System.Net.IPAddress]::Parse($Address).GetAddressBytes()
+          if ($Bytes.Length -ne 4) { throw "Not an IPv4 address: $Address" }
+          [Array]::Reverse($Bytes)
+          return [BitConverter]::ToUInt32($Bytes, 0)
+        }
+
+        $Network, $PrefixText = $Cidr.Split('/')
+        $Prefix = [int]$PrefixText
+        if ($Prefix -lt 0 -or $Prefix -gt 32) { throw "Invalid AIS CIDR: $Cidr" }
+        $Mask = [uint32]([math]::Pow(2, 32) - [math]::Pow(2, 32 - $Prefix))
+        $NetworkNumber = (ConvertTo-IPv4Number $Network) -band $Mask
+
+        # Wait for the guest OS to configure the AIS NIC. Match its actual IP,
+        # since Windows adapter names and interface indexes are image-dependent.
+        $Addresses = @()
+        for ($Attempt = 0; $Attempt -lt 24; $Attempt++) {
+          $Addresses = @(Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object {
+              $_.AddressState -eq 'Preferred' -and
+              ((ConvertTo-IPv4Number $_.IPAddress) -band $Mask) -eq $NetworkNumber
+            })
+          if ($Addresses.Count -gt 0) { break }
+          Start-Sleep -Seconds 5
+        }
+        if ($Addresses.Count -ne 1) {
+          throw "Expected one configured AIS IPv4 address in $Cidr; found $($Addresses.Count)"
+        }
+
+        $IfIndex = $Addresses[0].InterfaceIndex
+        Write-AisLog "Using $($Addresses[0].InterfaceAlias) (ifIndex=$IfIndex, IP=$($Addresses[0].IPAddress))"
+
+        # Keep the primary NIC's default gateway. The AIS gateway is a next hop
+        # only for the explicitly listed destination networks.
+        Set-NetIPInterface -InterfaceIndex $IfIndex -AddressFamily IPv4 -IgnoreDefaultRoutes Enabled
+        $AisDefaults = @(Get-NetRoute -InterfaceIndex $IfIndex -AddressFamily IPv4 `
+          -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+        foreach ($Route in $AisDefaults) {
+          $Route | Remove-NetRoute -Confirm:$false
+          Write-AisLog "Removed AIS default route via $($Route.NextHop)"
+        }
+
+        # The route must be in both stores: ActiveStore only is lost at reboot.
+        # New-NetRoute without -PolicyStore writes both, so a route missing from
+        # either store is removed wherever it exists and recreated once.
+        function Add-AisRoute([string]$Destination) {
+          $InStore = @{}
+          foreach ($Store in 'PersistentStore', 'ActiveStore') {
+            $InStore[$Store] = @(Get-NetRoute -PolicyStore $Store -InterfaceIndex $IfIndex `
+              -AddressFamily IPv4 -DestinationPrefix $Destination -ErrorAction SilentlyContinue)
+            if ($InStore[$Store] | Where-Object { $_.NextHop -ne $Gateway }) {
+              throw "Route $Destination already exists in $Store on AIS NIC with another gateway"
+            }
+          }
+
+          $Persistent = $InStore['PersistentStore'].Count -gt 0
+          $Active     = $InStore['ActiveStore'].Count -gt 0
+          if ($Persistent -and $Active) {
+            Write-AisLog "Route $Destination via $Gateway already present (persistent and active)"
+            return
+          }
+          if ($Persistent -or $Active) {
+            Write-AisLog "Route $Destination only in $(if ($Active) { 'ActiveStore' } else { 'PersistentStore' }); recreating in both"
+            foreach ($Store in 'PersistentStore', 'ActiveStore') {
+              $InStore[$Store] | Remove-NetRoute -Confirm:$false
+            }
+          }
+
+          New-NetRoute -InterfaceIndex $IfIndex -DestinationPrefix $Destination `
+            -NextHop $Gateway -RouteMetric 1 | Out-Null
+          Write-AisLog "Added route $Destination via $Gateway (persistent and active)"
+        }
+
+        %{ for dest in ais_routes ~}
+        Add-AisRoute '${dest}'
+        %{ endfor ~}
+
+        Get-NetRoute -PolicyStore PersistentStore -InterfaceIndex $IfIndex -AddressFamily IPv4 |
+          Format-Table DestinationPrefix, NextHop, RouteMetric -AutoSize |
+          Out-String | Add-Content -Path $LogPath
+
+        # Success: drop the retry task if an earlier run registered one.
+        if (Get-ScheduledTask -TaskName $RetryTask -ErrorAction SilentlyContinue) {
+          Unregister-ScheduledTask -TaskName $RetryTask -Confirm:$false
+          Write-AisLog "Removed startup retry task $RetryTask"
+        }
+        Write-AisLog 'AIS routes configured'
+      }
+      catch {
+        Write-AisLog "ERROR: $($_.Exception.Message)"
+        # Typically the AIS NIC had no IP yet. Retry at every startup and every
+        # 5 minutes until a run succeeds and removes the task. Registered only
+        # once, so retries started by the task itself don't re-register it.
+        try {
+          if (-not (Get-ScheduledTask -TaskName $RetryTask -ErrorAction SilentlyContinue)) {
+            $Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+              -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+            $Triggers = @(
+              (New-ScheduledTaskTrigger -AtStartup),
+              # No -RepetitionDuration: repeats indefinitely (Windows Server 2016+).
+              (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+                -RepetitionInterval (New-TimeSpan -Minutes 5))
+            )
+            # IgnoreNew: never two runs at once (each run can wait 2 minutes).
+            $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+              -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+            Register-ScheduledTask -TaskName $RetryTask -Action $Action -Trigger $Triggers `
+              -Settings $Settings -User 'SYSTEM' -RunLevel Highest | Out-Null
+            Write-AisLog "Registered retry task $RetryTask (at startup and every 5 minutes)"
+          }
+        }
+        catch {
+          Write-AisLog "ERROR: could not register retry task: $($_.Exception.Message)"
+        }
+        exit 1
+      }
+
+# HOTFIX: RDP authentication
+runcmd:
+  - 'echo "start cloud-init process" >> c:/cloud-init.log'
+  - 'netsh interface ipv4 show interfaces >> c:/cloud-init.log'
+  - 'timeout 10 > NUL'
+  - 'netsh interface ipv4 show interfaces >> c:/cloud-init.log'
+  - 'setlocal enabledelayedexpansion'
+  - 'set dnsservers=${dns_servers}'
+  - 'set /A c=1'
+  - 'echo "Setting DNS servers" >> c:/cloud-init.log'
+  - 'for %%a in ("%dnsservers:,=" "%") do ('
+  - 'if !c! == 1 ('
+  - '    echo "Setting main DNS server to %%~a" >> c:/cloud-init.log'
+  - '    netsh interface ipv4 set dns name="Ethernet Instance 0" static %%~a  >> c:/cloud-init.log'
+  - '    netsh interface ipv4 set dns name="Ethernet" static %%~a  >> c:/cloud-init.log'
+  - ') else ('
+  - 'echo "Setting secondary (index=!c!) DNS server to %%~a" >> c:/cloud-init.log'
+  - 'netsh interface ipv4 add dns name="Ethernet Instance 0" %%~a index=!c! >> c:/cloud-init.log'
+  - 'netsh interface ipv4 add dns name="Ethernet" %%~a index=!c! >> c:/cloud-init.log'
+  - ')'
+  - 'set /A c+=1'
+  - ')'
+  - 'netsh interface ipv4 show config >> c:/cloud-init.log'
+  - 'echo "test" >> c:/cloud-init.log'
+  - 'echo "Changing administrator password......" >> c:/cloud-init.log'
+  - 'net user administrator ${root_password} >> c:/cloud-init.log'
+  - 'echo "Set dns (${dns_servers}) on network interface" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile -Command "Get-NetAdapter | Where-Object {$_.Name -like "*Ethernet*"} | Set-DnsClientServerAddress -ServerAddresses ${dns_servers}" >> c:/cloud-init.log'
+  - 'net stop sshd >> c:/cloud-init.log'
+  - 'reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\sshd" /v ObjectName /d "LocalSystem" /f >> c:/cloud-init.log'
+  - 'net start sshd >> c:/cloud-init.log'
+  - 'reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-TCP" /v UserAuthentication /t REG_DWORD /d "0" /f'
+  - 'echo "Rename computer" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile - Command "Rename-Computer -NewName ${hostname} -confirm:$false"  >> c:/cloud-init.log'
+  - 'echo "Set Search List" >> c:/cloud-init.log'
+  - 'powershell.exe -inputformat none -noprofile -Command "Set-DnsClientGlobalSetting -SuffixSearchList @("apps.tech.net.intra","tech.net.intra","fr.net.intra","net.intra","fr.xcd.net.intra")"'
+  - 'tzutil /s "Romance Standard Time"'
+  - 'echo "Configure AIS routes" >> c:/cloud-init.log'
+  - 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\ProgramData\ais-routes.ps1 || echo "WARNING: AIS routes NOT configured; retry task AIS-Routes-Retry will retry every 5 minutes (see AIS lines above)" >> c:/cloud-init.log'
+  - 'echo "Done" >> c:/cloud-init.log'
+  - 'shutdown /r'
